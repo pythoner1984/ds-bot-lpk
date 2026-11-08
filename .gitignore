@@ -5,3 +5,4 @@
 image/lzc-build-image-context.tar
 *.tar
 build.log
+*.log
