@@ -1,0 +1,7 @@
+*.lpk
+# lzc-cli tars the build context into image/ and leaves its work dir behind, so
+# the next build would re-pack the previous tar.
+.lzc-cli-*
+image/lzc-build-image-context.tar
+*.tar
+build.log

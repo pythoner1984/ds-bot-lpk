@@ -1,0 +1,16 @@
+# Image-owned overlay, kept identical to upstream's docker/docker.patch.yml:
+# the container is the sandbox boundary, so only full access is offered, and the
+# bots' working folder is /workspace. `--patch` takes this file ahead of the
+# profile's own patch, so a user edit in the UI still wins.
+- id: permission
+  config:
+    presets:
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+        name: Full access
+        description: The container is the boundary. Bots can change every file it can see.
+    defaultPreset: danger-full-access
+- id: bot
+  config:
+    workspace: /workspace

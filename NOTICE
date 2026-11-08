@@ -1,0 +1,14 @@
+DS Bot for Lazycat (微服)
+Copyright 2026 lxf
+
+This product packages DS Bot (https://github.com/Fei2411/DS-Bot),
+Copyright Fei2411 and contributors, licensed under the Apache License 2.0.
+
+It installs and runs, unmodified:
+  - DeepSeek Harness (@deepseek-ai/dsh), published by DeepSeek on npm.
+  - The ds-bot plugin, published on npm by the DS Bot project.
+  - Caddy (https://caddyserver.com), Copyright Matthew Holt and The Caddy Authors,
+    licensed under the Apache License 2.0.
+
+No upstream source is modified by this repository; the packaging layer only adds
+a Dockerfile, two shell scripts and the Lazycat package manifest.

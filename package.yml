@@ -1,0 +1,57 @@
+# Version tracks this packaging layer, not upstream. The upstream plugin and the
+# DSH runtime are pinned by ARG DS_BOT_VERSION / DSH_VERSION in
+# image/Dockerfile — bump both places together.
+package: f00700f.ds-bot
+version: 0.1.0
+name: DS Bot
+description: 把 DeepSeek Harness 变成一队长期存在的 Bot：每个 Bot 有自己的记忆、模型、工作目录和浏览器，可以在群聊里互相派活。
+author: lxf
+license: Apache-2.0
+homepage: https://github.com/Fei2411/DS-Bot
+locales:
+  zh-CN:
+    name: DS Bot
+    description: 运行在 DeepSeek Harness 上的一队 Bot。每个 Bot 是一个独立的会话，有记忆、模型、工作目录，可以在群聊里互相协作。
+    usage: |
+      DS Bot 是一个装好 DeepSeek Harness 与 ds-bot 插件的 Web 应用。
+
+      首次使用：
+      1. 读出访问信息：在应用的文件里打开 `admin.txt`，或执行
+         `lzc-cli project exec --tty=false -s dsbot cat /data/admin.txt`
+      2. 打开给出的地址，用用户名密码登录（HTTP Basic）
+      3. Settings → Model providers 里加一个模型服务（火山方舟示例：API 地址
+         https://ark.cn-beijing.volces.com/api/v3，OpenAI 兼容协议，模型名用
+         控制台里的 ID）
+      4. 回聊天页选模型，新建 Bot，开始对话
+
+      说明：
+      - 数据在 /data（profile、会话、团队、密钥）与 /workspace（工作目录），
+        重启和升级都不丢
+      - 密码在 /data/.admin-password；删掉它并重启会重新生成
+      - 默认 Full access 审批：容器即边界，Bot 可以在容器里执行命令
+      - 没有 Chrome，浏览器类工具不可用
+  en-US:
+    name: DS Bot
+    description: Long-lived bots on DeepSeek Harness, each with its own session, memory, model and working folder.
+    usage: |
+      A web app that ships DeepSeek Harness with the ds-bot plugin installed.
+
+      First run:
+      1. Read `admin.txt` from the app's files, or run
+         `lzc-cli project exec --tty=false -s dsbot cat /data/admin.txt`
+      2. Open the URL and sign in with the generated user and password (HTTP Basic).
+      3. Settings -> Model providers: add a provider (e.g. Volcano Ark at
+         https://ark.cn-beijing.volces.com/api/v3, OpenAI-compatible, model id
+         from the console).
+      4. Pick a model, create a bot, send the first message.
+
+      Notes:
+      - Data lives in /data (profile, sessions, team, secrets) and /workspace
+        (bot working folders) and survives restarts and upgrades.
+      - The password is in /data/.admin-password; delete it and restart to
+        generate a new one.
+      - Approval defaults to Full access: the container is the boundary.
+      - There is no Chrome in the image, so browser tools are unavailable.
+permissions:
+  required:
+    - net.internet

@@ -1,0 +1,5 @@
+# Build-host line endings are not the container's: a CRLF entry.sh makes dash
+# exit with `set: Illegal option -`. Keep shell and YAML LF-only.
+* text=auto eol=lf
+*.png binary
+*.lpk binary

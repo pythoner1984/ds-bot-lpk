@@ -1,0 +1,55 @@
+usage: |
+  第一次使用
+
+  1. 在应用的「安装信息 / 文件」里打开 `admin.txt`，或者用
+     `lzc-cli project exec --tty=false -s dsbot cat /data/admin.txt`
+     读出访问地址、用户名和密码
+  2. 浏览器打开该地址，用上面的用户名密码登录（HTTP Basic）
+  3. 进入 Settings → Model providers，填一个模型服务（例如火山方舟：API 地址
+     `https://ark.cn-beijing.volces.com/api/v3`，协议 OpenAI 兼容，模型名照抄
+     控制台里的 ID），保存后回聊天页选模型
+  4. 在左侧新建一个 Bot，给它发第一条消息
+
+  说明
+  - 所有数据都在应用自己的数据卷里（`/data`：profile、会话、bot 团队、密钥，
+    `/workspace`：bot 的工作目录），重启和升级都不会丢
+  - 上传的包会自带一个内置密码；想换就删掉数据卷里的 `.admin-password`
+    再重启应用，密码会重新生成并写回 `admin.txt`
+  - 审批默认 Full access（bot 可以在容器里直接执行命令）。容器的边界就是
+    安全边界，但 `/data` 里也有模型密钥
+  - 容器里没有 Chrome，浏览器类工具与桌面级 computer use 不可用
+application:
+  subdomain: dsbot
+  # 整站都应当先经过平台登录和本应用的基本认证；不放开任何免登录路径。
+  public_path: []
+  upstreams:
+    - location: /
+      # 容器内的 Caddy（3080）转给 dsh web 的 127.0.0.1:3081。
+      backend: http://dsbot.f00700f.ds-bot.lzcapp:3080
+      disable_trim_location: true
+services:
+  dsbot:
+    image: embed:dsbot
+    binds:
+      - /lzcapp/var/data:/data
+      - /lzcapp/var/workspace:/workspace
+    environment:
+      - DSH_HOME=/data
+      # 平台终结 TLS，容器里只有 HTTP。run.sh 从平台注入的
+      # LAZYCAT_APP_DOMAIN 推出 https://<该域名>；要覆盖（自定义域名）时
+      # 解开下面这行。
+      # - DSBOT_PUBLIC_URL=https://dsbot.<你的盒子>.heiyu.space/
+    # tini reaps the processes bots leave behind and forwards signals; the
+    # platform gives no init for a service.
+    entrypoint: /usr/bin/tini -g -- /bin/sh /lzcapp/pkg/content/entry.sh
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e
+          "require('node:http').get('http://127.0.0.1:3080/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # The first start copies a profile and boots dsh, which loads every plugin.
+      start_period: 180s

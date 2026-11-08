@@ -1,0 +1,14 @@
+contentdir: ./content
+icon: icon.png
+manifest: ./lzc-manifest.yml
+# The packed .lpk lands next to this file. lzc-cli refuses to build when pkgout
+# is missing, so it is "./" (the template default) rather than a dist/ dir.
+pkgout: ./
+# Builder-side images (lzc-cli 2.x). The alias must match `image: embed:<alias>`
+# in lzc-manifest.yml. builder: remote builds on the box itself — the packaging
+# host has no Docker, and the box can reach only the DaoCloud docker mirror.
+images:
+  dsbot:
+    dockerfile: ./image/Dockerfile
+    context: ./image
+    builder: remote
