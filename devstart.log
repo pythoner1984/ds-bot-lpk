@@ -1,0 +1,10 @@
+WARN:: The current terminal environment has configured HTTP_PROXY proxy, which may cause access to Lazycat LCMD to fail. If the function is not affected, you can ignore this warning.
+Skipping environment variable 'CommonProgramFiles(x86)' because its name is invalid
+Skipping environment variable 'ProgramFiles(x86)' because its name is invalid
+Skipping environment variable 'CommonProgramFiles(x86)' because its name is invalid
+Skipping environment variable 'ProgramFiles(x86)' because its name is invalid
+Build config: D:\lxf\repos\ds-bot-lpk\lzc-build.yml
+Project app is running.
+NAME                    IMAGE                                                                     COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+f00700fds-bot-app-1     registry.lazycat.cloud/lzc/lzcapp:3.20.3-2                                "/lzcinit/f00700f.ds…"   app       39 seconds ago   Up 38 seconds (healthy)   
+f00700fds-bot-dsbot-1   sha256:0c6a7613b20d963841413721cd07f8200e395952db03a8d74f25be2eca4c0e50   "/usr/bin/tini -g --…"   dsbot     39 seconds ago   Up 38 seconds (healthy)   3080/tcp
