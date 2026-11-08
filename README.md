@@ -4,7 +4,7 @@
 
 上游代码**零改动**：这里只提供「镜像 + 启动脚本 + 平台清单」，构建时从 npm 装固定版本的 `@deepseek-ai/dsh` 与 `ds-bot` 插件，按微服的方式把它们跑起来。
 
-当前包版本 **0.1.3**，装在盒子上服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
+当前包版本 **0.1.4**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
 
 ---
 
@@ -16,7 +16,7 @@
 | --- | --- | --- | --- |
 | 镜像来源 | `docker.io` / `node:24-bookworm-slim` | 盒子**连不上** docker.io 与 ghcr.io | 全部 `FROM` 走 `docker.m.daocloud.io` 镜像站 |
 | 访问控制 | 单用户、只监听容器网段 | 平台把 `*.heiyu.space` 子域名公开，但**先要盒子账号登录** | 默认用平台登录当门；可选再叠 Basic Auth |
-| 一次性令牌 | 打开 dsh 打印的 `?token=` 链接 | 平台里没有终端可看 stdout（`app log` 未实现） | 启动脚本抓令牌，自动换成浏览器 Cookie |
+| 一次性令牌 | 打开 dsh 打印的 `?token=` 链接 | 平台里没有终端可看 stdout（`app log` 未实现） | 启动脚本抓令牌、自动换 Cookie，并在 dsh 每次重启后重抓 |
 | 进程模型 | compose 的 `init: true` | 平台不给 service 配 init | 镜像装 `tini` 作 PID 1 |
 
 此外 DSH 的两个硬约束在容器里必须显式喂参数：
@@ -33,20 +33,21 @@
                   │                 │
                   │                 ├─ 插件 ds-bot（Bot、群聊、记忆、技能、连接器）
                   │                 └─ profile /data/profiles/web
-                  ├─ /healthz  直答 200，不过任何认证
+                  ├─ /healthz  直答 200，不过认证
+                  ├─ /login    重新换取 Cookie（打不开时用）
                   ├─ 可选 Basic Auth（DSBOT_BASIC_AUTH=1）
                   └─ 首次访问：302 → /?token=… → DSH 换 Cookie → 回到 /
 
 数据卷
-  /data       profile、会话、bot 团队（bot/）、密钥（.credentials.yaml）、dsh.log、access.txt、admin.txt
+  /data       profile、会话、bot 团队（bot/）、密钥、dsh.log、access.txt、admin.txt、.plugin-version
   /workspace  bot 的工作目录
 ```
 
 三个脚本各管一段：
 
-- `content/entry.sh`：root 跑一次。`/data/profiles/web` 不存在就把 `/opt/dsh-template` 铺过去，改属主，然后 `setpriv` 降权到 uid 1000。
-- `content/run.sh`：uid 1000 常驻。起 `dsh`（带 3 秒原地重启循环）→ 从 `dsh.log` 抓 launch token → 写 `access.txt` → 渲染 Caddyfile → 校验后起 Caddy → 等 `/healthz` 通过。
-- `image/Dockerfile`：构建期就把 `ds-bot` 装进模板 profile，首启**不需要联网**。
+- `content/entry.sh`：root 跑一次。铺模板 profile、把 `/data` 里的 ds-bot 插件升到镜像自带版本、改属主（失败即退出，不掩盖），然后 `setpriv` 降权到 uid 1000。
+- `content/run.sh`：uid 1000 常驻。起 Caddy 与 dsh；**每次 dsh 启动都重抓 launch token、重写 `access.txt`、热加载 Caddy 配置**；dsh 退出就地重启（日志按次轮转，崩溃现场保留在 `dsh.log.prev`）。
+- `image/Dockerfile`：构建期就把 `ds-bot` 装进模板 profile，首启**不需要联网**；`test` 改成校验 `package.json` 里的实际版本。
 
 ---
 
@@ -57,7 +58,7 @@
 ```powershell
 cd ds-bot-lpk
 lzc-cli project release .          # 只出包
-# 产物：f00700f.ds-bot-v0.1.3.lpk
+# 产物：f00700f.ds-bot-v0.1.4.lpk
 ```
 
 首次构建要拉 `node:24-bookworm` 并 `npm install -g @deepseek-ai/dsh ds-bot`，约 3 分钟、镜像层 791.92 MiB / 15 layers；之后只改 `content/` 会命中 `Reuse cached OCI image package`，几秒出包。
@@ -65,12 +66,14 @@ lzc-cli project release .          # 只出包
 ## 安装 / 升级
 
 ```powershell
-lzc-cli app install .\f00700f.ds-bot-v0.1.3.lpk --apk n
+lzc-cli app install .\f00700f.ds-bot-v0.1.4.lpk --apk n
 ```
 
 安装完打开 `https://dsbot.<盒子名>.heiyu.space`。升级用同一个命令装新包，`/data` 与 `/workspace` 是平台卷，**不会被清空**。
 
-开发时可以用 `lzc-cli project deploy`（= build + install + start），它会同时把 dev project 拉起来，这样才能用 `project exec` 进容器。
+**升级时插件会跟着换**：镜像里带 `.plugin-version`，`entry.sh` 拿它和 `/data/.plugin-version` 比对，不一致就把新镜像里的 `ds-bot` 复制进 `/data/profiles/web/node_modules/` 并改 `package.json` 的依赖版本。profile 里的其它内容（模型服务、bot 设置）不动。所以「改 `DS_BOT_VERSION` → 重打包 → 重装」对老用户是真的生效的。
+
+开发时可以用 `lzc-cli project deploy`（= build + install + start），它会把 dev project 拉起来，这样才能用 `project exec` 进容器。
 
 ---
 
@@ -78,33 +81,47 @@ lzc-cli app install .\f00700f.ds-bot-v0.1.3.lpk --apk n
 
 三条独立的门，按顺序：
 
-1. **平台账号门**：`https://dsbot.<盒子>.heiyu.space` 先跳平台的 `Login to LazyCat Microservices`，过了才到本应用。默认就靠这一层。
+1. **平台账号门**：打开子域名先跳平台的 `Login to LazyCat Microservices`，过了才到本应用。默认就靠这一层。
 2. **Basic Auth（可选，默认关）**：应用设置里加 `DSBOT_BASIC_AUTH=1` 才启用，密码随机生成在 `/data/.admin-password`（0600），用户名默认 `admin`（可用 `DSBOT_ADMIN_USER` 改）。想自己指定密码就设 `DSBOT_ADMIN_PASSWORD`。
 3. **DSH 自己的令牌**：`dsh` 每次启动生成一次性 `?token=`，只有带它的请求能铸出 `dsh-auth-…` Cookie。
 
-默认行为（本包的取舍）：**第 3 层自动完成**。第一次打开 `/` 时 Caddy 直接 302 到 `/?token=<当次令牌>`，DSH 铸好 Cookie 再 303 回 `/`，之后浏览器一直带着 Cookie。Cookie 的签名密钥存在 `/data/.credentials.yaml` 的 grant 记录里，所以**重启应用不掉登录**；只有清了浏览器 Cookie 或换了浏览器才需要重新走一次。
+默认行为：**第 3 层自动完成**。第一次打开 `/`（或 `/index.html`）时 Caddy 直接 302 到 `/?token=<当次令牌>`，DSH 铸好 Cookie 再 303 回 `/`，之后浏览器一直带着 Cookie。Cookie 的签名密钥存在 `/data/.credentials.yaml` 的 grant 记录里、有效期 30 天，所以**应用重启不掉登录**。
 
-### 换浏览器 / 清了 Cookie 怎么办
+### 打不开的时候
 
-打开 `/data/access.txt` 里那条链接即可（每次应用重启会重写，指向当次令牌）：
+`/login` 就是为这件事准备的：它把浏览器送到当次令牌的链接上。三种常见情形：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 首次打开就 401 | 令牌链接还没被访问过 | 直接刷新，或访问 `/login` |
+| 换了浏览器 / 清了 Cookie | 没有 Cookie | `/login` |
+| 一直 401、`/login` 也 401 | 浏览器里存着**失效的旧 Cookie**（重装、重置 `/data`、换域名后） | 访问 `/login`；它带着令牌走，DSH 会覆盖旧 Cookie。仍不行就手动清该站点 Cookie |
+
+也可以直接看 `/data/access.txt`（每次 dsh 重启重写，指向当次令牌）：
 
 ```powershell
+cd D:\lxf\repos\ds-bot-lpk
 lzc-cli project exec --tty=false -s dsbot cat /data/access.txt
 ```
 
-也可以在应用的文件管理里直接看 `/data/access.txt`。
-
 ### 想恢复上游语义（令牌是唯一入口）
 
-设 `DSBOT_STRICT_AUTH=1`：关掉自动 302，只认 `?token=` 链接。适合把应用暴露给多人、又不想让任何过了平台登录的人直接进到你 bot 的情况。
+设 `DSBOT_STRICT_AUTH=1`：关掉自动 302，只认 `?token=` 链接。
 
-> 注意：默认配置下，**任何能登进这个盒子账号的人**打开子域名都会自动获得 bot 的完整控制权（包括它的密钥与工作目录）。单用户盒子没问题；多人共用盒子请开 `DSBOT_BASIC_AUTH=1` 或 `DSBOT_STRICT_AUTH=1`。
+---
+
+## 安全边界（请读）
+
+- **容器内 Caddy 监听 `:3080`（所有网卡）**，平台按容器名转发进来。这意味着**同一台盒子上别的应用**理论上可以直接连 `dsbot.f00700f.ds-bot.lzcapp:3080`，绕过平台登录门，并在默认配置下拿到自动换发的 Cookie —— 也就是 bot 的完整控制权。单用户盒子、只装自己可信的应用时这是可接受的取舍；盒子上跑着别人的应用请加 `DSBOT_BASIC_AUTH=1` 或 `DSBOT_STRICT_AUTH=1`。
+- **令牌会出现在 302 的 `Location` 里**，可能进入平台反代日志与浏览器历史；它只在当次 dsh 进程内有效。
+- **`/data/.credentials.yaml` 里是模型 API key（明文，0600）**，Full access 的 bot 能读到并外发。别把敏感目录挂进 `/workspace`。
+- **审批默认 Full access**（`image/lazycat.patch.yml`）：容器即边界，bot 可以在容器里执行命令。
 
 ---
 
 ## 验证装好了
 
-在容器里跑这三条，全部通过就是通的（`0.1.3` 实测）：
+在容器里跑这三条，全部通过就是通的（`0.1.4` 实测）：
 
 ```powershell
 lzc-cli project exec --tty=false -s dsbot sh
@@ -117,6 +134,8 @@ curl -s -D - -o /dev/null -c /tmp/c "http://127.0.0.1:3080/?token=$TOK" | head -
 curl -s -b /tmp/c -o /dev/null -w '%{http_code} %{size_download}\n' http://127.0.0.1:3080/
 #   → 200 40234（首页 HTML）
 ```
+
+健康检查现在同时看两件事：`/healthz` 回 200 **且** `3081` 上有人监听（`image/healthcheck.mjs`）。dsh 崩在重启循环里时，平台会看到 unhealthy 并重启应用，而不是对着一个只会答 `ok` 的 Caddy 报健康。
 
 ---
 
@@ -133,7 +152,7 @@ curl -s -b /tmp/c -o /dev/null -w '%{http_code} %{size_download}\n' http://127.0
 
 Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api/coding`，协议选 `anthropic-messages`。
 
-> 能不能出字只取决于账号侧：`ModelNotOpen` = 该模型没开通，`InvalidSubscription` = Coding Plan 过期。这两类和打包无关。
+> 能不能出字只取决于账号侧：`ModelNotOpen` = 该模型没开通，`InvalidSubscription` = Coding Plan 过期。
 
 ---
 
@@ -145,36 +164,51 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 | 插件来源 | 源码 `npm pack` | npm 上的 `ds-bot@0.3.1` |
 | 认证 | 无（靠容器网络边界） | 平台登录 + 自动令牌换 Cookie；可选 Basic Auth |
 | 监听 | 容器 IP:3080 | Caddy :3080 → dsh 127.0.0.1:3081 |
-| 健康检查 | 容器内 dsh 端口 | `/healthz`（Caddy 直答，不过认证） |
-| 数据 | `/data`、`/workspace` | 相同，挂到平台卷 |
+| 健康检查 | 容器内 dsh 端口 | `/healthz` + `3081` 存活 |
+| 升级 | 重建镜像 | 重装 lpk，插件随镜像更新、profile 保留 |
 | 权限 | `danger-full-access` | 相同（容器即边界） |
 
 ---
 
 ## 已知限制
 
-- **没有 Chrome**：浏览器工具、依赖浏览器的 computer use 不可用。远端云电脑（如果有）不受影响。
-- **审批默认 Full access**：见 `image/lazycat.patch.yml`。`/data` 里有模型密钥，bot 能读到；别把不该给 bot 的目录挂进 `workspace`。
+- **没有 Chrome**：浏览器工具、依赖浏览器的 computer use 不可用。远端云电脑不受影响。
 - **SSE 平台层未验证**：容器内已 `flush_interval -1`，平台反向代理是否缓冲事件流无法从容器内观测。若回复「一次性蹦出来」，原因在这层。
-- **升级要重打包**：`DSH_VERSION` / `DS_BOT_VERSION` 在 `image/Dockerfile`，两者需与上游要求对齐（ds-bot 0.3.1 面向 dsh `0.2.2-rc.1`）。
 - **没有回滚**：平台不保留历史 lpk，升级前自行留旧包。
-- **`lzc-cli app log` 未实现**（返回 `not yet realized`），容器日志只能进容器看（`/data/dsh.log`）。
+- **`lzc-cli app log` 未实现**（`not yet realized`），容器日志只能进容器看。
+- **插件自更新与 DSH 版本无闸门**：ds-bot 可以在应用内把自己升到新版（写 `/data`），但 DSH 核心在 `/usr/local`（root、不可写）不会跟着动。若新版要求更高的 DSH，下次启动会失败 —— 回退：`dsh plugin --profile web add ds-bot@0.3.1`。
 
 ## 排障
 
 ```powershell
-cd ds-bot-lpk
+cd D:\lxf\repos\ds-bot-lpk
 'ps -eo pid,uid,args | grep -E "caddy|dsh" | grep -v grep; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
-'cat /tmp/Caddyfile; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
 'tail -n 50 /data/dsh.log; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+'tail -n 50 /data/dsh.log.prev; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+'cat /tmp/Caddyfile; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
 ```
 
-- 必须在 `ds-bot-lpk` 目录里跑 `project exec`，否则报 `Build config file not found`；命令里的 `-` 开头参数会被 yargs 吃掉，所以用 stdin 喂 `sh`，并在末尾补 `; echo FIN`（PowerShell 管道行尾的 `\r` 会粘到最后一个 token）。
-- **一直 401 `dsh web authentication required`**：Cookie 没铸上。看 `/data/access.txt` 的链接是否被完整打开过；或确认 Caddyfile 里 `@needsToken` 带了 `not query token=*`（缺这一条会 302 死循环）。
-- **302 到自己**：同上，`not query token=*` 缺失。
+- 必须在 `ds-bot-lpk` 目录里跑 `project exec`，否则报 `Build config file not found`；命令里 `-` 开头的参数会被 yargs 吃掉，所以用 stdin 喂 `sh`，并在末尾补 `; echo FIN`（PowerShell 管道行尾的 `\r` 会粘到最后一个 token）。
+- **一直 401**：先试 `/login`；再不行看 `/data/access.txt`。带着失效 Cookie 的情况 `/login` 能自愈（令牌换 Cookie 时不要求无 Cookie，实测 303）。
+- **dsh 反复重启**：最新一次日志在 `/data/dsh.log`，上一次在 `dsh.log.prev`。
+- **一直 `Status_Starting` / unhealthy**：`ps` 看 caddy 与 dsh 是否都在；Caddyfile 空或校验失败时 `run.sh` 会 `exit 1`，平台会重启应用。
 - **页面能开、接口 403**：`--trusted-host` 没拿到平台域名（`LAZYCAT_APP_DOMAIN` 为空）。
-- **一直 `Status_Starting`**：进容器看 `ps`；Caddy 起不来会被 `caddy validate` 拦住并 `exit 1`，平台会重启——这时先看 `/tmp/Caddyfile` 是否为空文件。
-- **/tmp/Caddyfile 为空**：脚本在 `set -u` 下遇到了未初始化变量（0.1.1 的老问题，0.1.2 起已预初始化并加双守卫）。
+
+## 审查记录（0.1.4）
+
+独立审查者逐条核对后确认并已修：
+
+1. 升级不生效 —— 旧版只在 `/data/profiles/web` 不存在时铺模板，改 `DS_BOT_VERSION` 对已装用户无用。改用 `.plugin-version` 比对 + 就地替换插件。
+2. dsh 重启后 token 不更新 —— 旧版只在启动时抓一次，重启后 302 指向死令牌。改为每次 dsh 启动重抓 + 热加载 Caddy（`admin 127.0.0.1:2019`）。
+3. 崩溃现场被毁 —— 旧版每轮 `: > dsh.log` 清空。改为轮转到 `dsh.log.prev`。
+4. `/index.html` 直接 401 —— matcher 从 `path /` 扩到 `path / /index.html`。
+5. 失效 Cookie 造成永久 401 —— 新增 `/login`（实测带失效 Cookie 请求 `?token=` 仍返回 303）。实现上用命名 matcher `@recover path /login`，不用嵌套 `route`：容器内实测嵌套写法下请求会穿到反代、拿到 dsh 的 404。
+6. `chown` 失败被 `|| true` 吞掉 —— 改为失败即 `exit 1`。
+7. `admin.txt` 一直停在首启内容（含已作废的密码）—— 每次启动重写。
+8. heredoc 注释里的反引号被命令替换（stderr 每次出现 `route: not found`）—— 去掉反引号。
+9. 健康检查只看 Caddy —— 改为同时探 `3081`。
+
+**审查者提出但实测不成立**：`chown -R` 会解引用符号链接从而让 bot 提权到 root。容器内实测（`ln -s /usr/bin/tini /tmp/ch3/escape` 后 `chown -R 1000:1000 /tmp/ch3`）目标 `/usr/bin/tini` 仍是 `root:root`，链接本身才改属主；GNU `chown -R` 默认 `-P`。仍显式加了 `-h` 以防语义变化。
 
 ## 许可与归属
 

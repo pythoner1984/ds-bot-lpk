@@ -1,9 +1,14 @@
 #!/bin/sh
-# Runs as uid 1000, under tini. Two listeners:
-#   3080  Caddy — the only one the platform proxy reaches. It answers the health
-#         probe, optionally demands a password, and flushes SSE immediately.
+# Runs as uid 1000 under tini. It owns two listeners and one supervisor loop:
+#   3080  Caddy — the only port the platform proxy reaches. It answers the
+#         platform health probe, can demand a password, hands a first visit the
+#         DSH launch token, and flushes SSE immediately.
 #   3081  dsh --profile web, on loopback. DSH binds one concrete address and
 #         refuses a wildcard; loopback also means Caddy is the only way in.
+#
+# The supervisor restarts dsh in place. Each dsh start mints a new launch token,
+# so the token has to be re-read and Caddy reloaded every time — a token pinned
+# at boot would turn the first crash-restart into a permanent 401.
 set -u
 
 PORT=3081
@@ -13,6 +18,13 @@ ADMIN_FILE=/data/admin.txt
 ACCESS_FILE=/data/access.txt
 PASSWORD_FILE=/data/.admin-password
 DSH_LOG=/data/dsh.log
+DSH_LOG_PREV=/data/dsh.log.prev
+CADDY_ADMIN=127.0.0.1:2019
+CADDYFILE=/tmp/Caddyfile
+
+TOKEN=""
+CADDY_PID=""
+DSH_PID=""
 
 log() { printf '[dsbot] %s\n' "$*"; }
 
@@ -25,7 +37,6 @@ fi
 #     through first — that is the default and needs nothing from us;
 #   * an optional HTTP basic-auth fence, off unless DSBOT_BASIC_AUTH=1.
 # DSH's own launch token is handled separately, below.
-AUTH_ARGS=""
 BASIC_AUTH_BLOCK=""
 ADMIN_USER="${DSBOT_ADMIN_USER:-admin}"
 if [ "${DSBOT_BASIC_AUTH:-0}" = "1" ] || [ "${DSBOT_BASIC_AUTH:-0}" = "true" ]; then
@@ -45,101 +56,70 @@ if [ "${DSBOT_BASIC_AUTH:-0}" = "1" ] || [ "${DSBOT_BASIC_AUTH:-0}" = "true" ]; 
     log "caddy hash-password failed; refusing to serve with a broken auth fence"
     exit 1
   fi
-  ADMIN_USER_LINE="${ADMIN_USER} ${HASH}"
   BASIC_AUTH_BLOCK="		basic_auth {
-			${ADMIN_USER_LINE}
+			${ADMIN_USER} ${HASH}
 		}"
 fi
 
-# dsh is the process that must survive; restart it here rather than letting the
-# platform take the whole app down. `set +e` because a non-zero exit must log
-# and retry — with `set -e` the subshell would just end.
-(
-  set +e
-  while :; do
-    : > "$DSH_LOG"
-    if [ -n "$DOMAIN" ] && [ -n "$PUBLIC_URL" ]; then
-      dsh --profile web \
-        --patch /opt/ds-bot/lazycat.patch.yml \
-        --no-open --host 127.0.0.1 --port "$PORT" \
-        --public-url "$PUBLIC_URL" --trusted-host "$DOMAIN" >>"$DSH_LOG" 2>&1
-    elif [ -n "$PUBLIC_URL" ]; then
-      dsh --profile web \
-        --patch /opt/ds-bot/lazycat.patch.yml \
-        --no-open --host 127.0.0.1 --port "$PORT" \
-        --public-url "$PUBLIC_URL" >>"$DSH_LOG" 2>&1
-    else
-      dsh --profile web \
-        --patch /opt/ds-bot/lazycat.patch.yml \
-        --no-open --host 127.0.0.1 --port "$PORT" >>"$DSH_LOG" 2>&1
-    fi
-    rc=$?
-    log "dsh exited ($rc); restarting in 3s"
-    sleep 3
-  done
-) &
-
-# dsh mints a fresh launch token every time it starts and only a request that
-# carries it can mint the browser session cookie. The token is therefore
-# captured from the startup line and used twice: once to exchange the cookie
-# automatically for the first visit, and once in access.txt, so a session that
-# lost its cookie can be recovered without a terminal.
-i=0
-TOKEN=""
-while [ "$i" -lt 150 ]; do
-  TOKEN=$(sed -n 's/.*[?&]token=\([A-Za-z0-9._~-]\{8,\}\).*/\1/p' "$DSH_LOG" 2>/dev/null | head -n 1)
-  [ -n "$TOKEN" ] && break
-  i=$((i + 1))
-  sleep 1
-done
-
-if [ -n "$TOKEN" ]; then
-  log "captured the launch token from dsh"
-  if [ -n "$PUBLIC_URL" ]; then
-    ACCESS_URL="${PUBLIC_URL%/}/?token=${TOKEN}"
-  else
-    ACCESS_URL="http://127.0.0.1:3080/?token=${TOKEN}"
-  fi
+write_access() {
   umask 077
   {
-    printf 'Open this once: %s\n\n' "$ACCESS_URL"
-    printf 'That link mints the browser cookie dsh needs; it is spent on the first\n'
-    printf 'visit and a new one is written on every app restart. If the app answers\n'
-    printf '"dsh web authentication required", reopen the link below.\n'
+    printf 'Open this once: %s\n\n' "$1"
+    printf 'That link mints the browser cookie dsh needs. Tokens are per dsh\n'
+    printf 'process: this file is rewritten whenever dsh restarts. If the app\n'
+    printf 'answers "dsh web authentication required", open the URL below, or\n'
+    printf 'open the app at /login which does the same thing.\n'
   } > "$ACCESS_FILE"
   chmod 600 "$ACCESS_FILE"
-else
-  log "no launch token seen after 150s; the UI will ask for one (see $DSH_LOG)"
-  ACCESS_URL=""
-fi
+}
 
-# DSBOT_STRICT_AUTH=1 keeps upstream's behaviour: the token link is the only way
-# in. The default trades that for the platform's own login — one less secret to
-# read out of a container on a box whose UI is already behind an account.
-if [ "${DSBOT_STRICT_AUTH:-0}" = "1" ]; then
-  REDIRECT_BLOCK=""
-else
-  if [ -n "${TOKEN:-}" ]; then
-    REDIRECT_BLOCK="	@needsToken {
-		path /
-		not header Cookie *dsh-auth-*
-		not query token=*
-	}
-	redir @needsToken /?token=${TOKEN} 302"
+# Written on every start so it can never describe a configuration that is no
+# longer running (an earlier version wrote it once and kept a stale password).
+write_admin() {
+  umask 077
+  {
+    printf 'DS Bot on this box\n\n'
+    [ -n "$PUBLIC_URL" ] && printf 'URL:       %s\n' "$PUBLIC_URL"
+    if [ -n "${PASSWORD:-}" ]; then
+      printf 'Login:     HTTP Basic, user %s\n' "$ADMIN_USER"
+      printf 'Password:  %s\n' "$PASSWORD"
+    else
+      printf 'Login:     the platform account for this box (no app password set)\n'
+      printf '           set DSBOT_BASIC_AUTH=1 in the app settings to add one\n'
+    fi
+    printf 'Recover:   %s\n' "${PUBLIC_URL%/}/login (or $ACCESS_FILE)"
+    printf 'Models:    Settings -> Model providers\n'
+  } > "$ADMIN_FILE"
+  chmod 600 "$ADMIN_FILE"
+}
+
+# The Caddyfile is regenerated, not edited: the token inside it changes with
+# every dsh start. Nothing in here may use backticks or $ — this is an
+# unquoted heredoc, so both would be expanded by the shell.
+render_caddy() {
+  if [ -n "$TOKEN" ]; then
+    REDIRECT_BLOCK="		@needsToken {
+			path / /index.html
+			not header Cookie *dsh-auth-*
+			not query token=*
+		}
+		redir @needsToken /?token=${TOKEN} 302
+		@recover path /login
+		redir @recover /?token=${TOKEN} 302"
   else
-    REDIRECT_BLOCK=""
+    REDIRECT_BLOCK="		@recover path /login
+		respond @recover \"the app is still starting; retry in a few seconds\" 503"
   fi
-fi
 
-cat > /tmp/Caddyfile <<EOF
+  cat > "$CADDYFILE" <<EOF
 {
-	admin off
+	admin ${CADDY_ADMIN}
 	auto_https off
 }
 
 :3080 {
 	# The platform health probe runs without credentials; everything else goes
-	# through the fences below. `route` keeps this order instead of Caddy's
+	# through the fences below. \`route\` keeps this order instead of Caddy's
 	# directive ordering.
 	route /healthz {
 		respond "ok" 200
@@ -148,61 +128,121 @@ cat > /tmp/Caddyfile <<EOF
 	route {
 ${BASIC_AUTH_BLOCK}
 ${REDIRECT_BLOCK}
-		encode zstd gzip
+		encode gzip
 		reverse_proxy 127.0.0.1:${PORT} {
 			flush_interval -1
 		}
 	}
 }
 EOF
+}
 
-if [ ! -f "$ADMIN_FILE" ]; then
-  umask 077
-  {
-    printf 'DS Bot on this box\n\n'
-    [ -n "$PUBLIC_URL" ] && printf 'URL:       %s\n' "$PUBLIC_URL"
-    if [ -n "${PASSWORD:-}" ]; then
-      printf 'User:      %s\n' "$ADMIN_USER"
-      printf 'Password:  %s\n' "$PASSWORD"
-    else
-      printf 'Login:     the platform account for this box (no app password set)\n'
-      printf '           set DSBOT_BASIC_AUTH=1 in the app settings to add one\n'
-    fi
-    printf 'Fallback:  %s\n\n' "$ACCESS_FILE"
-    printf 'Model providers and API keys are set in the app: Settings -> Model providers.\n'
-  } > "$ADMIN_FILE"
-  chmod 600 "$ADMIN_FILE"
-fi
-
-if [ ! -s /tmp/Caddyfile ]; then
-  log "Caddyfile came out empty; refusing to start a half-configured proxy"
-  exit 1
-fi
-if ! caddy validate --config /tmp/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-  log "Caddyfile does not validate; refusing to start a half-configured proxy"
-  caddy validate --config /tmp/Caddyfile --adapter caddyfile 2>&1 | sed 's/^/[dsbot] /'
-  exit 1
-fi
-
-caddy run --config /tmp/Caddyfile --adapter caddyfile &
-CADDY_PID=$!
-trap 'kill "$CADDY_PID" 2>/dev/null || true' TERM INT
-
-i=0
-while [ "$i" -lt 90 ]; do
-  if node -e "require('node:http').get('http://127.0.0.1:3080/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))" 2>/dev/null; then
-    break
+start_caddy() {
+  if [ ! -s "$CADDYFILE" ]; then
+    log "Caddyfile came out empty; refusing to start a half-configured proxy"
+    exit 1
   fi
-  i=$((i + 1))
-  sleep 2
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    log "Caddyfile does not validate; refusing to start a half-configured proxy"
+    caddy validate --config "$CADDYFILE" --adapter caddyfile 2>&1 | sed 's/^/[dsbot] /'
+    exit 1
+  fi
+  caddy run --config "$CADDYFILE" --adapter caddyfile &
+  CADDY_PID=$!
+  log "caddy started (pid $CADDY_PID)"
+}
+
+reload_caddy() {
+  if curl -sf -o /dev/null -X POST \
+      -H 'Content-Type: text/caddyfile' \
+      --data-binary "@$CADDYFILE" \
+      "http://${CADDY_ADMIN}/load"; then
+    log "caddy reloaded with the new token"
+    return 0
+  fi
+  log "caddy reload failed; restarting the whole app"
+  exit 1
+}
+
+start_dsh() {
+  [ -f "$DSH_LOG" ] && mv -f "$DSH_LOG" "$DSH_LOG_PREV"
+  : > "$DSH_LOG"
+  if [ -n "$DOMAIN" ] && [ -n "$PUBLIC_URL" ]; then
+    dsh --profile web \
+      --patch /opt/ds-bot/lazycat.patch.yml \
+      --no-open --host 127.0.0.1 --port "$PORT" \
+      --public-url "$PUBLIC_URL" --trusted-host "$DOMAIN" >>"$DSH_LOG" 2>&1 &
+  elif [ -n "$PUBLIC_URL" ]; then
+    dsh --profile web \
+      --patch /opt/ds-bot/lazycat.patch.yml \
+      --no-open --host 127.0.0.1 --port "$PORT" \
+      --public-url "$PUBLIC_URL" >>"$DSH_LOG" 2>&1 &
+  else
+    dsh --profile web \
+      --patch /opt/ds-bot/lazycat.patch.yml \
+      --no-open --host 127.0.0.1 --port "$PORT" >>"$DSH_LOG" 2>&1 &
+  fi
+  DSH_PID=$!
+}
+
+# dsh prints the token on one line once it is listening. Wait for it while the
+# process is alive, and give up early when it dies instead of sitting out the
+# whole timeout on every crash.
+capture_token() {
+  i=0
+  while [ "$i" -lt 120 ]; do
+    found=$(sed -n 's/.*[?&]token=\([A-Za-z0-9._~-]\{8,\}\).*/\1/p' "$DSH_LOG" 2>/dev/null | head -n 1)
+    if [ -n "$found" ]; then
+      printf '%s' "$found"
+      return 0
+    fi
+    kill -0 "$DSH_PID" 2>/dev/null || return 1
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+shutdown() {
+  [ -n "$DSH_PID" ] && kill "$DSH_PID" 2>/dev/null || true
+  [ -n "$CADDY_PID" ] && kill "$CADDY_PID" 2>/dev/null || true
+  exit 0
+}
+trap shutdown TERM INT
+
+render_caddy
+start_caddy
+write_admin
+log "starting dsh; a new launch token follows"
+
+while :; do
+  start_dsh
+  if captured=$(capture_token); then
+    if [ "$captured" != "$TOKEN" ]; then
+      TOKEN=$captured
+      log "captured a new launch token"
+      if [ -n "$PUBLIC_URL" ]; then
+        ACCESS_URL="${PUBLIC_URL%/}/?token=${TOKEN}"
+      else
+        ACCESS_URL="http://127.0.0.1:3080/?token=${TOKEN}"
+      fi
+      write_access "$ACCESS_URL"
+      render_caddy
+      reload_caddy
+      log "one-time login link: $ACCESS_URL"
+    fi
+  else
+    log "no launch token within 120s; see $DSH_LOG"
+  fi
+
+  # Wait for dsh to exit while still noticing a dead proxy.
+  while :; do
+    kill -0 "$DSH_PID" 2>/dev/null || break
+    kill -0 "$CADDY_PID" 2>/dev/null || { log "caddy exited; taking the app down"; exit 1; }
+    sleep 2
+  done
+  wait "$DSH_PID" 2>/dev/null
+  rc=$?
+  log "dsh exited ($rc); restarting in 3s"
+  sleep 3
 done
-
-log "ready: ${PUBLIC_URL:-http://127.0.0.1:3080/}"
-if [ -n "${ACCESS_URL:-}" ]; then
-  log "one-time login link: $ACCESS_URL"
-fi
-if [ -f "$ADMIN_FILE" ]; then
-  sed 's/^/[dsbot] /' "$ADMIN_FILE"
-fi
-
-wait "$CADDY_PID"

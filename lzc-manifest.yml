@@ -3,8 +3,10 @@ usage: |
 
   1. 用盒子账号打开 https://dsbot.<你的盒子>.heiyu.space —— 平台会先要你登录，
      然后直接进入 DS Bot（DSH 的进程令牌由启动脚本自动换成了浏览器 Cookie）
-  2. 如果页面回 `dsh web authentication required`：打开应用数据卷里的
-     `/data/access.txt`，把里面的 `?token=` 链接访问一次即可
+  2. 如果页面回 `dsh web authentication required`（换了浏览器、清了 Cookie，
+     或浏览器里存着上次的失效 Cookie）：访问同域名下的 `/login`，它会自动
+     重新换一次 Cookie。仍然不行就看应用数据卷里的 `/data/access.txt`，
+     把里面的 `?token=` 链接访问一次
   3. 进入 Settings → Model providers，填一个模型服务（火山方舟示例：API 地址
      `https://ark.cn-beijing.volces.com/api/v3`，OpenAI 兼容协议，模型名照抄
      控制台里已开通的 ID），保存后回聊天页选模型
@@ -12,9 +14,13 @@ usage: |
 
   说明
   - 数据在 /data（profile、会话、bot 团队、密钥）与 /workspace（工作目录），
-    重启和升级都不会丢
+    重启和升级都不会丢；升级镜像时启动脚本会把 /data 里的 ds-bot 插件换成
+    新镜像自带的版本，profile 里的模型设置不动
   - 默认只靠平台登录把门；想要应用自己的密码，在应用设置里加
-    `DSBOT_BASIC_AUTH=1`，会自动生成密码并写进 /data/admin.txt
+    `DSBOT_BASIC_AUTH=1`，密码会生成并写进 /data/admin.txt
+  - 容器内的 Caddy 监听所有网卡（平台按容器名转发进来），同一台盒子上别的
+    应用理论上可以直接访问它；如果盒子上跑着别人的应用，建议加
+    `DSBOT_BASIC_AUTH=1` 或 `DSBOT_STRICT_AUTH=1`
   - 审批默认 Full access：容器即边界，Bot 可以在容器里执行命令
   - 容器里没有 Chrome，浏览器类工具不可用
 application:
@@ -46,11 +52,12 @@ services:
     # platform gives no init for a service.
     entrypoint: /usr/bin/tini -g -- /bin/sh /lzcapp/pkg/content/entry.sh
     healthcheck:
+      # Checks the proxy *and* that dsh is listening: Caddy answers /healthz
+      # with 200 even while dsh sits in a crash loop, and that is the state a
+      # restart is supposed to fix.
       test:
         - CMD-SHELL
-        - >-
-          node -e
-          "require('node:http').get('http://127.0.0.1:3080/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+        - node /opt/ds-bot/healthcheck.mjs
       interval: 15s
       timeout: 10s
       retries: 10
