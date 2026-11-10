@@ -2,7 +2,7 @@
 # DSH runtime are pinned by ARG DS_BOT_VERSION / DSH_VERSION in
 # image/Dockerfile — bump both places together.
 package: f00700f.ds-bot
-version: 0.1.4
+version: 0.1.9
 name: DS Bot
 description: 把 DeepSeek Harness 变成一队长期存在的 Bot：每个 Bot 有自己的记忆、模型、工作目录和浏览器，可以在群聊里互相派活。
 author: lxf
@@ -68,3 +68,8 @@ locales:
 permissions:
   required:
     - net.internet
+
+
+
+
+

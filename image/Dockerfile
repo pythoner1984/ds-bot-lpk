@@ -37,8 +37,11 @@ RUN apt-get update \
 
 # --allow-scripts is the list upstream's docker/Dockerfile installs with; the
 # native modules in it fail to build without it.
-RUN corepack enable \
- && npm config set registry "$NPM_REGISTRY" --global \
+# pnpm is pinned because `dsh plugin` shells out to it at runtime: a version
+# resolved by corepack at build time and another one resolved at run time make
+# pnpm refuse the profile's existing node_modules.
+RUN npm config set registry "$NPM_REGISTRY" --global \
+ && npm install -g pnpm@12.18.0 --allow-scripts=pnpm \
  && npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" \
       --allow-scripts=@deepseek-ai/dsh-subprocess-local,node-pty,koffi,@google/genai,protobufjs \
  && npm cache clean --force
@@ -48,11 +51,19 @@ RUN corepack enable \
 # data volume by entry.sh, and `.plugin-version` is what lets a later image
 # replace the plugin inside an existing volume — a directory check alone would
 # pass for whatever the volume happened to hold.
-RUN mkdir -p /opt/dsh-template \
- && DSH_HOME=/opt/dsh-template dsh plugin --profile web add "ds-bot@${DS_BOT_VERSION}" \
+#
+# HOME is /data here on purpose: pnpm records the store it linked a
+# node_modules from inside node_modules/.modules.yaml, and refuses to touch that
+# node_modules from any other store. Runtime runs as uid 1000 with HOME=/data,
+# so building under the same HOME is what makes DS Bot's own in-app update
+# (`dsh plugin add`) work later. The store itself is dropped from the image at
+# the end of this step; only the recorded path has to agree.
+RUN mkdir -p /opt/dsh-template /data \
+ && HOME=/data DSH_HOME=/opt/dsh-template dsh plugin --profile web add "ds-bot@${DS_BOT_VERSION}" \
  && node -e 'const want=process.argv[1];const got=require("/opt/dsh-template/profiles/web/package.json").dependencies["ds-bot"];if(got!==want){console.error(`profile has ds-bot ${got}, expected ${want}`);process.exit(1)}' "${DS_BOT_VERSION}" \
  && printf '%s' "${DS_BOT_VERSION}" > /opt/dsh-template/.plugin-version \
- && chmod -R go-w /usr/local/lib/node_modules
+ && chmod -R go-w /usr/local/lib/node_modules \
+ && rm -rf /data/.local/share/pnpm/store
 
 COPY --from=edge /usr/bin/caddy /usr/local/bin/caddy
 RUN caddy version && chmod 0755 /usr/local/bin/caddy

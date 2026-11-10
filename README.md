@@ -4,7 +4,7 @@
 
 上游代码**零改动**：这里只提供「镜像 + 启动脚本 + 平台清单」，构建时从 npm 装固定版本的 `@deepseek-ai/dsh` 与 `ds-bot` 插件，按微服的方式把它们跑起来。
 
-当前包版本 **0.1.4**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
+当前包版本 **0.1.9**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
 
 ---
 
@@ -58,7 +58,7 @@
 ```powershell
 cd ds-bot-lpk
 lzc-cli project release .          # 只出包
-# 产物：f00700f.ds-bot-v0.1.4.lpk
+# 产物：f00700f.ds-bot-v0.1.9.lpk
 ```
 
 首次构建要拉 `node:24-bookworm` 并 `npm install -g @deepseek-ai/dsh ds-bot`，约 3 分钟、镜像层 791.92 MiB / 15 layers；之后只改 `content/` 会命中 `Reuse cached OCI image package`，几秒出包。
@@ -66,7 +66,7 @@ lzc-cli project release .          # 只出包
 ## 安装 / 升级
 
 ```powershell
-lzc-cli app install .\f00700f.ds-bot-v0.1.4.lpk --apk n
+lzc-cli app install .\f00700f.ds-bot-v0.1.9.lpk --apk n
 ```
 
 安装完打开 `https://dsbot.<盒子名>.heiyu.space`。升级用同一个命令装新包，`/data` 与 `/workspace` 是平台卷，**不会被清空**。
@@ -121,7 +121,7 @@ lzc-cli project exec --tty=false -s dsbot cat /data/access.txt
 
 ## 验证装好了
 
-在容器里跑这三条，全部通过就是通的（`0.1.4` 实测）：
+在容器里跑这三条，全部通过就是通的（`0.1.9` 实测）：
 
 ```powershell
 lzc-cli project exec --tty=false -s dsbot sh
@@ -176,7 +176,18 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 - **SSE 平台层未验证**：容器内已 `flush_interval -1`，平台反向代理是否缓冲事件流无法从容器内观测。若回复「一次性蹦出来」，原因在这层。
 - **没有回滚**：平台不保留历史 lpk，升级前自行留旧包。
 - **`lzc-cli app log` 未实现**（`not yet realized`），容器日志只能进容器看。
-- **插件自更新与 DSH 版本无闸门**：ds-bot 可以在应用内把自己升到新版（写 `/data`），但 DSH 核心在 `/usr/local`（root、不可写）不会跟着动。若新版要求更高的 DSH，下次启动会失败 —— 回退：`dsh plugin --profile web add ds-bot@0.3.1`。
+- **插件自更新可用，但 DSH 版本无闸门**：`dsh plugin --profile web add ds-bot@<版本>` 在容器里已跑通（0.1.9 实测，5 秒左右升降级都行），DS Bot 应用内的「更新」走的就是这条通路，写 `/data` 后下次 dsh 启动生效。但 DSH 核心在 `/usr/local`（root、`go-w`）不会跟着动；若新版插件要求更高的 DSH，下次启动会失败 —— 回退：`dsh plugin --profile web add ds-bot@0.3.1`。
+
+## 应用内更新（0.1.9 实测）
+
+应用内更新能成功，前提是容器里 pnpm 的 store 路径与构建时记录在 `node_modules/.modules.yaml` 里的一致。本包构建时用 `HOME=/data` 装插件，并把 pnpm 钉在 12.18.0，所以运行时（uid 1000、`HOME=/data`）可以直接 `pnpm add`：
+
+```powershell
+cd D:\lxf\repos\ds-bot-lpk
+'setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/data sh -c ''cd /data && dsh plugin --profile web add ds-bot@0.3.0''; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+```
+
+实测输出 `dsh-bot 0.3.1 → 0.3.0`、`Done in 5.3s using pnpm v12.18.0`，再升回 0.3.1 同样是 5.9 秒，应用全程 healthy。镜像里的 `.plugin-version` 用 semver 比较：应用内升到更新版本后，重装同版本镜像不会把它拽回去；只有镜像里的插件更新时才覆盖。
 
 ## 排障
 
@@ -193,6 +204,16 @@ cd D:\lxf\repos\ds-bot-lpk
 - **dsh 反复重启**：最新一次日志在 `/data/dsh.log`，上一次在 `dsh.log.prev`。
 - **一直 `Status_Starting` / unhealthy**：`ps` 看 caddy 与 dsh 是否都在；Caddyfile 空或校验失败时 `run.sh` 会 `exit 1`，平台会重启应用。
 - **页面能开、接口 403**：`--trusted-host` 没拿到平台域名（`LAZYCAT_APP_DOMAIN` 为空）。
+
+## 容器实测记录（0.1.5 – 0.1.9）
+
+在盒子上逐轮装包验证，撞到三个真故障，都是"上一版看着启动成功、换一次就起不来"的类型：
+
+1. **应用内更新被 pnpm store 挡住**：镜像里用 root 构建，`node_modules/.modules.yaml` 记下 `storeDir: /root/.local/share/pnpm/store/v11`；运行时 uid 1000 的 store 是 `/data/.local/share/pnpm/store/v11`，`pnpm add` 直接拒绝改这个 `node_modules`。试过 `npm config set store-dir`（npm 报这不是合法 npm 选项）、`/usr/local/etc/npmrc`（pnpm 不读）、`npm_config_store_dir`（pnpm 12 不认）全部无效。最终构建改用 `HOME=/data` 装插件，让记录的路径与运行时一致；pnpm 从 corepack 的浮动解析改为钉死 12.18.0。
+2. **种子不完整**：老逻辑 `cp -a "$TEMPLATE/." /data/` 在中途被打断时只落下几个小文件、没有 `node_modules`，dsh 报 `failed to read profile manifest … ENOENT`。改为先拷到 `profiles/web.tmp` 再 `mv`，并把"profile 是否完整"判定改成同时看 `package.json` 与 `node_modules/ds-bot`。
+3. **根属主导致 EACCES**：种子由 root 写，而首启标记 `/data/.owner-fixed` 已存在会让递归 chown 跳过，dsh 以 uid 1000 启动时报 `failed to read profile manifest … EACCES`。改为每次启动都检查 profile 属主，不是 1000 就递归 chown；脚本自己写过东西（种子/换插件）时也强制再走一遍全局 chown。
+
+另一个排查教训：这个容器里的 `ps` 是 busybox，`ps -o …` 只列本会话进程，看不到 caddy/dsh —— 判断进程在不在要用 `curl` 探端口，别信 `ps` 的行数。`lzc-cli app log` 仍是 `not yet realized`，`project log` 在服务未运行时也拿不到，可靠日志只有 `/data/dsh.log` 与 `dsh.log.prev`。
 
 ## 审查记录（0.1.4）
 
