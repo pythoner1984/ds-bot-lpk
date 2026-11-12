@@ -4,7 +4,7 @@
 
 上游代码**零改动**：这里只提供「镜像 + 启动脚本 + 平台清单」，构建时从 npm 装固定版本的 `@deepseek-ai/dsh` 与 `ds-bot` 插件，按微服的方式把它们跑起来。
 
-当前包版本 **0.1.9**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
+当前包版本 **0.1.11**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
 
 ---
 
@@ -38,15 +38,18 @@
                   ├─ 可选 Basic Auth（DSBOT_BASIC_AUTH=1）
                   └─ 首次访问：302 → /?token=… → DSH 换 Cookie → 回到 /
 
+票据桥 127.0.0.1:3092 ──► http://app.<包名>.lzcx（补 X-HC-USER-TICKET）
+
 数据卷
   /data       profile、会话、bot 团队（bot/）、密钥、dsh.log、access.txt、admin.txt、.plugin-version
+              proxy.log（Caddy 访问日志，票据来源）、bridge.log、run/
   /workspace  bot 的工作目录
 ```
 
 三个脚本各管一段：
 
 - `content/entry.sh`：root 跑一次。铺模板 profile、把 `/data` 里的 ds-bot 插件升到镜像自带版本、改属主（失败即退出，不掩盖），然后 `setpriv` 降权到 uid 1000。
-- `content/run.sh`：uid 1000 常驻。起 Caddy 与 dsh；**每次 dsh 启动都重抓 launch token、重写 `access.txt`、热加载 Caddy 配置**；dsh 退出就地重启（日志按次轮转，崩溃现场保留在 `dsh.log.prev`）。
+- `content/run.sh`：uid 1000 常驻。起 Caddy、票据桥与 dsh；**每次 dsh 启动都重抓 launch token、重写 `access.txt`、热加载 Caddy 配置**；dsh 退出就地重启（日志按次轮转，崩溃现场保留在 `dsh.log.prev`）。
 - `image/Dockerfile`：构建期就把 `ds-bot` 装进模板 profile，首启**不需要联网**；`test` 改成校验 `package.json` 里的实际版本。
 
 ---
@@ -156,6 +159,65 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 
 ---
 
+## 调用微服平台自带的能力（0.1.11 起）
+
+`package.yml` 里声明了两块，装好后平台的只读资源会挂进容器：
+
+```yaml
+import_resources:
+  - kind: skills
+  - kind: mcp-providers
+permissions:
+  required:
+    - lzcapp.user_delegate
+```
+
+需要盒子 **LzcOS ≥ 1.5.2**。资源出现在 `/lzcapp/run/resources/skills/<包名>/<资源>/SKILL.md` 与 `/lzcapp/run/resources/mcp-providers/<包名>/<资源>/mcp.yml`。
+
+**绕不过去的一关：** 平台只把 `X-HC-USER-TICKET` 注入到"真人从网页进应用"的请求里，没有主动申请的接口；不带票据直接请求 `http://app.<包名>.lzcx/...` 一律 401。所以容器里跑了一个票据桥：
+
+```
+dsh → connectors → http://127.0.0.1:3092/p/<包名><endpoint>
+                        │  Caddy 的 json 访问日志里读出最新的 X-Hc-User-Ticket
+                        └→ http://app.<包名>.lzcx<endpoint>（Host 保持 .lzcx）
+```
+
+实现是 `content/resource-bridge.mjs`：Caddy 把每个请求头写进 `/data/proxy.log`（Cookie / Authorization 由 Caddy 自己抹掉），桥在有请求时读日志尾部，缓存 10 分钟；没有票据时返回 503 并说明原因。
+
+**已注册的连接器**（`state.connectors.lzc-*`，实测工具数）：
+
+| 连接器 | 平台包 | 工具数 | 能干的事 |
+| --- | --- | --- | --- |
+| `lzc-cloud-lazycat-lightos-entry` | lightos.entry | 9 | 开/读/关一台微服终端、发布与查询端口转发、列实例 |
+| `lzc-shared-folder` | shell.files | 7 | 网盘共享文件夹的成员与规则 |
+| `lzc-filedrop` | lazycat-filedrop-skill | 11 | 在线设备间浏览/搜索/复制文件 |
+| `lzc-cloud-lazycat-app-photo` | photo | 10 | 相册、照片元数据与统计 |
+| `lzc-lazycat-office-cli` | lazycat-office-cli-skill | 1 | 一个 `officecli` 工具，覆盖 docx/xlsx/pptx 的读写改验 |
+| `lzc-manateelazycat-lzcapp-reader` | reader | 12 | 书架、分类、检索、阅读位置 |
+| `lzc-lazycat-subtitle-skill` | subtitle | 2 | 搜索与下载字幕 |
+| `lzc-lazycat-agent-browser` | agent-browser | 22 | 在盒子的浏览器里开页、截图、抓正文 |
+
+**已注册的技能**：12 个 `SKILL.md` 作为 DS Bot 的 capabilities 导入（安娜书籍下载、文件管家、电影搜索、音乐下载、Office 套件、字幕、终端、云盘、待办、WorkBuddy、mediasaber 等），bot 按 name/description 发现、按需读取正文。
+
+注意事项：
+
+- 票据跟着"人"走：**没有人从浏览器打开过应用，连接器就只会返回 503**；登录过期后同理，重新打开一次页面即可（桥会在 10 分钟内换上新票据）。
+- 桥只监听 `127.0.0.1:3092`，不出容器；`/data/proxy.log` 会记录访问日志（8 MiB 轮转，保留 2 份）。
+- `mediasaber` 的 `endpoint` 带查询串（`/mcp?view=default`），DS Bot 的自定义连接器不接受，暂未注册。
+
+排障：
+
+```sh
+tail -n 20 /data/bridge.log                 # 有没有学到票据
+grep -c X-Hc-User-Ticket /data/proxy.log    # 日志里有没有票据
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST http://127.0.0.1:3092/p/cloud.lazycat.app.lazycat-office-cli-skill/mcp \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+```
+
+---
+
 ## 与上游 docker 形态的差异
 
 | 项 | 上游 `docker/` | 本项目 |
@@ -167,6 +229,7 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 | 健康检查 | 容器内 dsh 端口 | `/healthz` + `3081` 存活 |
 | 升级 | 重建镜像 | 重装 lpk，插件随镜像更新、profile 保留 |
 | 权限 | `danger-full-access` | 相同（容器即边界） |
+| 平台资源 | 无 | `import_resources` + `lzcapp.user_delegate`，经票据桥调用 |
 
 ---
 

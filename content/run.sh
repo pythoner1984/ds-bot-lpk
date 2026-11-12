@@ -21,10 +21,13 @@ DSH_LOG=/data/dsh.log
 DSH_LOG_PREV=/data/dsh.log.prev
 CADDY_ADMIN=127.0.0.1:2019
 CADDYFILE=/tmp/Caddyfile
+PROXY_LOG=/data/proxy.log
+BRIDGE_LOG=/data/bridge.log
 
 TOKEN=""
 CADDY_PID=""
 DSH_PID=""
+BRIDGE_PID=""
 
 log() { printf '[dsbot] %s\n' "$*"; }
 
@@ -125,6 +128,17 @@ render_caddy() {
 		respond "ok" 200
 	}
 
+	# Request headers are logged so the resource bridge can read back the
+	# platform's per-user ticket (it has no API, only injected headers).
+	log {
+		output file ${PROXY_LOG} {
+			roll_size 8MiB
+			roll_keep 2
+		}
+		format json
+		level INFO
+	}
+
 	route {
 ${BASIC_AUTH_BLOCK}
 ${REDIRECT_BLOCK}
@@ -162,6 +176,14 @@ reload_caddy() {
   fi
   log "caddy reload failed; restarting the whole app"
   exit 1
+}
+
+start_bridge() {
+  mkdir -p /data/run
+  chmod 700 /data/run 2>/dev/null || true
+  node /lzcapp/pkg/content/resource-bridge.mjs >>"$BRIDGE_LOG" 2>&1 &
+  BRIDGE_PID=$!
+  log "resource bridge started (pid $BRIDGE_PID)"
 }
 
 start_dsh() {
@@ -206,12 +228,14 @@ capture_token() {
 shutdown() {
   [ -n "$DSH_PID" ] && kill "$DSH_PID" 2>/dev/null || true
   [ -n "$CADDY_PID" ] && kill "$CADDY_PID" 2>/dev/null || true
+  [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
   exit 0
 }
 trap shutdown TERM INT
 
 render_caddy
 start_caddy
+start_bridge
 write_admin
 log "starting dsh; a new launch token follows"
 
@@ -239,6 +263,10 @@ while :; do
   while :; do
     kill -0 "$DSH_PID" 2>/dev/null || break
     kill -0 "$CADDY_PID" 2>/dev/null || { log "caddy exited; taking the app down"; exit 1; }
+    if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+      log "resource bridge exited; starting it again"
+      start_bridge
+    fi
     sleep 2
   done
   wait "$DSH_PID" 2>/dev/null
