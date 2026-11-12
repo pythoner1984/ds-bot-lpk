@@ -12,7 +12,7 @@
 # comes from the registry.
 ARG NODE_IMAGE=docker.m.daocloud.io/library/node:24-bookworm
 ARG DSH_VERSION=0.2.2-rc.1
-ARG DS_BOT_VERSION=0.3.1
+ARG DS_BOT_VERSION=0.3.6
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 
 # Same binary as the OMB package and upstream's deploy/local stack, so the

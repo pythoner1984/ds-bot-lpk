@@ -161,7 +161,7 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 | 项 | 上游 `docker/` | 本项目 |
 | --- | --- | --- |
 | 基础镜像 | `node:24-bookworm-slim` | `docker.m.daocloud.io/library/node:24-bookworm` |
-| 插件来源 | 源码 `npm pack` | npm 上的 `ds-bot@0.3.1` |
+| 插件来源 | 源码 `npm pack` | npm 上的 `ds-bot@0.3.6` |
 | 认证 | 无（靠容器网络边界） | 平台登录 + 自动令牌换 Cookie；可选 Basic Auth |
 | 监听 | 容器 IP:3080 | Caddy :3080 → dsh 127.0.0.1:3081 |
 | 健康检查 | 容器内 dsh 端口 | `/healthz` + `3081` 存活 |
@@ -176,7 +176,7 @@ Coding Plan 走 anthropic 协议，地址 `https://ark.cn-beijing.volces.com/api
 - **SSE 平台层未验证**：容器内已 `flush_interval -1`，平台反向代理是否缓冲事件流无法从容器内观测。若回复「一次性蹦出来」，原因在这层。
 - **没有回滚**：平台不保留历史 lpk，升级前自行留旧包。
 - **`lzc-cli app log` 未实现**（`not yet realized`），容器日志只能进容器看。
-- **插件自更新可用，但 DSH 版本无闸门**：`dsh plugin --profile web add ds-bot@<版本>` 在容器里已跑通（0.1.9 实测，5 秒左右升降级都行），DS Bot 应用内的「更新」走的就是这条通路，写 `/data` 后下次 dsh 启动生效。但 DSH 核心在 `/usr/local`（root、`go-w`）不会跟着动；若新版插件要求更高的 DSH，下次启动会失败 —— 回退：`dsh plugin --profile web add ds-bot@0.3.1`。
+- **插件自更新可用，但 DSH 版本无闸门**：`dsh plugin --profile web add ds-bot@<版本>` 在容器里已跑通（0.1.9 实测，5 秒左右升降级都行），DS Bot 应用内的「更新」走的就是这条通路，写 `/data` 后下次 dsh 启动生效。但 DSH 核心在 `/usr/local`（root、`go-w`）不会跟着动；若新版插件要求更高的 DSH，下次启动会失败 —— 回退到镜像自带版本：`dsh plugin --profile web add ds-bot@0.3.6`。
 
 ## 应用内更新（0.1.9 实测）
 
@@ -188,6 +188,23 @@ cd D:\lxf\repos\ds-bot-lpk
 ```
 
 实测输出 `dsh-bot 0.3.1 → 0.3.0`、`Done in 5.3s using pnpm v12.18.0`，再升回 0.3.1 同样是 5.9 秒，应用全程 healthy。镜像里的 `.plugin-version` 用 semver 比较：应用内升到更新版本后，重装同版本镜像不会把它拽回去；只有镜像里的插件更新时才覆盖。
+
+### 0.3.1 → 0.3.6（2026-11-13 实测）
+
+同一台实例上把插件从 0.3.1 升到 0.3.6，全程只动 `/data`，镜像与 lpk 未变。
+
+```powershell
+# 备份（约 1 MB）
+tar -czf /data/backups/ds-bot-0.3.1-<ts>.tgz -C /data/profiles/web/node_modules ds-bot
+# 升级
+setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/data sh -c 'cd /data && dsh plugin --profile web add ds-bot@0.3.6'
+```
+
+`pnpm` 3.7 秒完成（`Packages: +5 -1`，peer 依赖有一条 warning，不影响启动）。升级后把 `/data/.plugin-version` 一并写成 `0.3.6`，否则镜像里若还是旧版本，比较基准会失真。
+
+冒烟结果：`/healthz` 200、`dsh.log` 无 fatal、`state.json` 里 17 个 bot / 1 个群 / 主 Bot 与 `connectors.github` 全在、GitHub MCP `initialize` 200 + `tools/list` 43 个工具。上游 0.3.6 的 `src/host/im/platforms/weixin.js` 已经自带 `SESSION_EXPIRED = -14`、`withSlash`、`isUpdatesAnswer`，之前手打的微信补丁不需要了。
+
+回滚：`tar -xzf /data/backups/ds-bot-0.3.1-<ts>.tgz -C /data/profiles/web/node_modules`，再把 `package.json` 里的 `"ds-bot"` 改回 `0.3.1`，重启 dsh。
 
 ## 排障
 
