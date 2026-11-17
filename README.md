@@ -4,7 +4,7 @@
 
 上游代码**零改动**：这里只提供「镜像 + 启动脚本 + 平台清单」，构建时从 npm 装固定版本的 `@deepseek-ai/dsh` 与 `ds-bot` 插件，按微服的方式把它们跑起来。
 
-当前包版本 **0.1.11**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
+当前包版本 **0.1.14**，服务名 `dsbot`，默认地址 `https://dsbot.<盒子名>.heiyu.space`。
 
 ---
 
@@ -268,6 +268,51 @@ setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/data sh -c 'cd /data &
 冒烟结果：`/healthz` 200、`dsh.log` 无 fatal、`state.json` 里 17 个 bot / 1 个群 / 主 Bot 与 `connectors.github` 全在、GitHub MCP `initialize` 200 + `tools/list` 43 个工具。上游 0.3.6 的 `src/host/im/platforms/weixin.js` 已经自带 `SESSION_EXPIRED = -14`、`withSlash`、`isUpdatesAnswer`，之前手打的微信补丁不需要了。
 
 回滚：`tar -xzf /data/backups/ds-bot-0.3.1-<ts>.tgz -C /data/profiles/web/node_modules`，再把 `package.json` 里的 `"ds-bot"` 改回 `0.3.1`，重启 dsh。
+
+### 0.3.6 → 0.3.8（2026-11-17 事故与修复）
+
+**这一轮不是正常升级，是一次真实故障。** 现场是容器 `Up 4 days (healthy)`、`/healthz` 200、`/` 仍能 302，但界面变成一个空的 DSH 外壳——31 个 bot 的数据还在 `state.json` 里，只是没有任何 UI 入口。
+
+`/data/dsh.log.prev` 留下的因果链：
+
+```
+dsh: fatal load failure: Error: cannot get required service "llm" in inactive context
+    at supported (.../ds-bot/src/host/local-agents/index.js:117:38)
+    at applyRoutes (.../local-agents/index.js:123:10)
+    at scan (.../local-agents/index.js:59:5)
+[ds-bot] ds-bot: update to ds-bot@0.3.8 failed: bundle-in-use
+```
+
+三件事叠在一起：
+
+1. **0.3.6 的 `local-agents/index.js:117`** 直接读 `ctx.llm?.registerAdapter`，而 `scan()` 是模块加载期 `void scan()` 起的异步任务、没有 `disposed` 保护。应用内更新走的是热卸载/重装，卸载窗口里 `scan()` 的续体仍会跑，此时 context 已 inactive，读 `ctx.llm` 直接抛错，**整个 dsh 进程 fatal 退出**。
+2. 进程死掉之后，DSH 的 plugin manager 仍在同一轮里判定条目还在 loader 中注册，抛 `bundle-in-use`，更新回滚失败。
+3. 更新流程在安装新版本之前会先把 bundle 从 `dsh.profile.bundles` 里取消选中。0.3.6 的 `update.js` 只有在 `removeBundle` 返回错误且 `changed` 时才走 `recover()`；进程已经死了，那一步没跑，于是 `package.json` 里 `dependencies` 还有 `ds-bot`、`bundles` 里却没有——**DSH 就按纯 `dsh-base + dsh-web-app` 启动了**。
+
+0.3.8 修了第 1 条（新增 `let disposed = false`、`scan()` 开头 `if (disposed) return []`、读服务改成 try/catch 的 `serviceOf(ctx, 'llm')`），也补了第 3 条的 `recover()` → `setBundleEnabled(name, true)` 兜底。但要让它跑起来，必须先手工把 bundles 补回去：
+
+```powershell
+cd D:\lxf\repos\ds-bot-lpk
+# 1. 备份（插件树 + state.json）
+'tar -czf /data/backups/ds-bot-0.3.6-<ts>.tgz -C /data/profiles/web node_modules/ds-bot package.json; cp /data/bot/state.json /data/backups/state-<ts>.json; echo BACKUP_OK; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+# 2. 用 CLI 升插件，绕开会崩进程的热更新
+'setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/data sh -c "cd /data && dsh plugin --profile web add ds-bot@0.3.8"; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+# 3. 把 ds-bot 补回 bundles（0.1.12 起 entry.sh 会自动做这一步）
+'node /lzcapp/pkg/content/bundle-repair.mjs /data/profiles/web/package.json; echo rc=$?; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+# 4. 写版本标记并重启 dsh
+'printf %s 0.3.8 > /data/.plugin-version; chown 1000:1000 /data/.plugin-version; pkill -f "dsh --profile web"; echo FIN' | lzc-cli project exec --tty=false -s dsbot sh
+```
+
+修复后验证：`dsh --profile web --dump-config` 里重新出现 `- id: bot / name: ds-bot`（`grep -c ds-bot` = 5）、首页 HTML 的 bundle 列表里重新出现 `ds-bot/client.js`、`?token=` → 303 + Cookie → 200 且标题 `DeepSeek Harness`、`state.json` 里 31 bots / 12 connectors / 31 skills 全在、`dsh.log` 无 fatal。
+
+**教训**：在容器里升级插件，永远用第 2 步的 CLI 形式，不要点界面里的"更新"——界面更新走热卸载，撞上任何未修的发版期 bug 就是整个进程死一次；即使不死，也可能把 bundles 弄丢。`.plugin-version` 是打包层自己的记账，升级后必须同步写，否则重装镜像时会按旧版本比较。
+
+**打包层自己的两个坑（0.1.13 → 0.1.14）**：
+
+1. `ensure_bundle` 最初把 JS 直接内联在 `node -e '…'` 里，而 JS 注释里有 `plugin's` / `shell's`——**撇号提前闭合了 shell 的单引号字符串**，node 报 `SyntaxError: Unexpected end of input`，`case` 落到 `*)` 分支 `exit 1`，容器刚起就退，平台只给一个 `Status_Error` + `Error message: (empty)`。现在这段逻辑独立成 `content/bundle-repair.mjs`，shell 里只剩 `node …mjs "$PROFILE/package.json"` 和退出码判断。
+2. 平台的 `lzc-cli app log` 恒为 `not yet realized`，服务没起来时 `project log` 也拒答，**启动期崩溃完全无迹可查**。0.1.13 起 `entry.sh` 在 `set -eu` 之后立刻把 stdout/stderr 重定向到 `/data/boot.log`（上一轮轮转为 `boot.log.prev`），`run.sh` 通过 `exec` 继承，所以这个文件就是整个 boot 过程。上面那个 SyntaxError 就是靠它才看到的。
+
+0.1.14 的实测（`tokamak`，镜像 sha256 `8eca3aa6…`）：`Status_Running`、`boot.log` 里 `[boot] … container start` → caddy/resource bridge/dsh 依次起来 → `one-time login link`；`?token=` 303 → Cookie → `200 / 39,716 字节 / <title>DeepSeek Harness</title>`、页面里有 `ds-bot/client.js`、`/login` 302 回同一个 token；`state.json` 31 bots / 1 room / 12 connectors / 31 skills。自愈也当场验过：把 `ds-bot` 从 `bundles` 里删掉再 `project start`，`entry.sh` 把它补回末尾，再跑一次 `bundle-repair.mjs` 返回 rc=0（幂等）。
 
 ## 排障
 

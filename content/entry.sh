@@ -4,6 +4,17 @@
 # hand the process tree to uid 1000. It never comes back.
 set -eu
 
+# The platform keeps no readable log for a running app: `lzc-cli app log` says
+# "not yet realized" and `project log` refuses once the service is down, which is
+# exactly when the container's stdout matters. Keep our own, on the volume, so a
+# container that dies before dsh ever starts still leaves a trace. run.sh
+# inherits these descriptors through exec, so this file is the whole boot.
+if [ -f /data/boot.log ]; then
+  mv -f /data/boot.log /data/boot.log.prev
+fi
+exec >>/data/boot.log 2>&1
+echo "[boot] $(date -u +%FT%TZ) container start"
+
 APP_UID=1000
 APP_GID=1000
 TEMPLATE=/opt/dsh-template
@@ -81,6 +92,21 @@ if [ -n "$wanted" ] && node -e '
     log "template has no ds-bot to install; leaving the volume alone"
   fi
 fi
+
+# A DS Bot update removes the bundle before installing the new one, so a crash in
+# that window leaves the package in `dependencies` but gone from `bundles`, and DSH
+# then starts as a bare shell. bundle-repair.mjs owns the check; this only acts on
+# its exit code: 3 means the file was rewritten.
+ensure_bundle() {
+  node /lzcapp/pkg/content/bundle-repair.mjs "$PROFILE/package.json" || bundle_rc=$?
+  case "${bundle_rc:-0}" in
+    0) ;;
+    3) log "repaired the profile bundle list"; WROTE=1 ;;
+    *) log "bundle repair failed"; exit 1 ;;
+  esac
+  bundle_rc=0
+}
+ensure_bundle
 
 # The profile is the one tree dsh must read as uid 1000, and it is also the one
 # a previous container may have seeded as root. Check the owner every start:
